@@ -447,6 +447,85 @@ If any of these come back empty, check `journalctl -u otelcol -f` first — it'l
 
 ---
 
+## CentOS / RHEL variant
+
+Everything above targets Ubuntu/Debian. The Prometheus, Loki, Tempo, and OTel Collector steps are **unchanged on CentOS/RHEL** — they're direct binary/tarball downloads from GitHub releases, not distro packages, and the systemd units are identical across distros. Only Grafana's install method, prerequisite package installs, firewalling, and one SELinux consideration differ. This section covers just those differences; follow the rest of the guide as written.
+
+### Prerequisite packages
+
+Anywhere the main guide says `apt-get install -y <package>`, use `dnf` instead (or `yum` on CentOS 7):
+
+```bash
+sudo dnf install -y wget gnupg2 unzip
+```
+
+### Grafana OSS via the RPM repo
+
+Replace all of Section 5 with:
+
+```bash
+sudo tee /etc/yum.repos.d/grafana.repo > /dev/null <<'EOF'
+[grafana]
+name=grafana
+baseurl=https://rpm.grafana.com
+repo_gpgcheck=1
+enabled=1
+gpgcheck=1
+gpgkey=https://rpm.grafana.com/gpg.key
+sslverify=1
+sslcacert=/etc/pki/tls/certs/ca-bundle.crt
+EOF
+
+sudo dnf install -y grafana
+sudo systemctl enable --now grafana-server
+sudo systemctl status grafana-server --no-pager
+```
+
+**Verify:** `curl http://localhost:3000/api/health` → `{"database": "ok", ...}`, same as the Ubuntu path.
+
+Section 6 (data source provisioning) and Section 7 (pointing your services at the collector) are unchanged — same file paths, same config.
+
+### SELinux — the one CentOS-specific failure mode to watch for
+
+If SELinux is enforcing (`getenforce`), it can silently block a service even when Unix file permissions (`chown`) are correct — this is the most likely new failure mode you'll hit on CentOS that doesn't exist on Ubuntu. It's especially worth checking on:
+
+- **Tempo's `/var/tempo` directory** — a hardcoded path outside the ones this guide explicitly sets ownership on, and non-standard paths are exactly what SELinux tends to flag.
+- **Any binary running from `/usr/local/bin`** — some SELinux policies restrict execution from non-package-managed locations.
+
+If a service fails to start and `journalctl -u <service>` shows nothing useful (permission-denied-shaped errors with no clear cause, similar to the `mkdir /var/tempo: permission denied` error found while building this guide, but happening even after `chown` is confirmed correct), check for SELinux denials specifically:
+
+```bash
+sudo ausearch -m avc -ts recent
+```
+
+If that shows denials, either add a proper policy exception (`audit2allow` can generate one from the denial log), or, for a quick unblock while testing, temporarily set permissive mode:
+
+```bash
+sudo setenforce 0
+```
+
+Don't leave it in permissive mode in production — this is a diagnostic step, not a fix. Once you know SELinux is the actual blocker, write a targeted policy exception rather than disabling enforcement.
+
+### Firewall — `firewalld` instead of `ufw`
+
+```bash
+sudo firewall-cmd --permanent --add-port=4317/tcp --add-port=4318/tcp   # OTel Collector
+sudo firewall-cmd --permanent --add-port=9090/tcp                       # Prometheus
+sudo firewall-cmd --permanent --add-port=3100/tcp                       # Loki
+sudo firewall-cmd --permanent --add-port=3200/tcp --add-port=4327/tcp --add-port=4328/tcp --add-port=9096/tcp  # Tempo
+sudo firewall-cmd --reload
+```
+
+As with the Ubuntu/`ufw` version, this opens the ports broadly — for production, scope these to your application hosts' source IPs using a rich rule instead of a plain port, e.g.:
+
+```bash
+sudo firewall-cmd --permanent --zone=public --add-rich-rule='rule family="ipv4" source address="<app-host-ip>/32" port protocol="tcp" port="4318" accept'
+```
+
+repeated per port and per app host, rather than opening the port to the whole zone.
+
+---
+
 ## Firewall note
 
 None of these services should be reachable from the public internet except Grafana's UI (and even that ideally sits behind a reverse proxy with TLS and auth, not exposed directly on 3000). Lock down the following to only your application hosts, via `ufw` or your cloud provider's security groups:
