@@ -388,8 +388,385 @@ sudo systemctl status grafana-server --no-pager
 Grafana's web UI is now at `http://<your-server-ip>:3000` — default login is `admin` / `admin`, forced password change on first login.
 
 ---
+## 6. Grafana Alloy (Log Collection)
 
-## 6. Wire up Grafana's data sources
+Grafana Alloy is responsible for collecting structured JSON log files written by each service and forwarding them to Loki. This separates log shipping from the OpenTelemetry Collector, allowing the collector to focus exclusively on traces and metrics.
+
+The final observability architecture is:
+
+```text
+                 +-------------------+
+                 |    Applications   |
+                 +-------------------+
+                  |        |       |
+                  |        |       |
+             Traces    Metrics   JSON Logs
+                  |        |       |
+                  |        |       |
+                  |        |   Grafana Alloy
+                  |        |       |
+                  |        |       |
+                  +--------+       |
+                           |       |
+                  OpenTelemetry    |
+                     Collector     |
+                     |        |     |
+                     |        |     |
+                  Tempo   Prometheus |
+                               |     |
+                               +-----+
+                                     |
+                                    Loki
+                                      |
+                                  Grafana OSS
+```
+
+The OpenTelemetry Collector is responsible only for traces and metrics. Grafana Alloy is responsible only for log collection and forwarding.
+
+---
+
+## Standardize the log directory
+
+All services should write logs to a common location:
+
+```text
+/var/log/pague/
+├── control-plane-api/
+│   └── application.log
+├── ingestion-api/
+│   └── application.log
+├── sms-gateway-api/
+│   └── application.log
+├── smpp-server/
+│   └── application.log
+├── worker/
+│   └── application.log
+└── webhooks/
+    └── application.log
+```
+
+Create the directory structure:
+
+```bash
+sudo mkdir -p /var/log/pague/{control-plane-api,ingestion-api,sms-gateway-api,smpp-server,worker,webhooks}
+```
+
+Each application should configure its logger to write to its own `application.log`.
+
+Example:
+
+```text
+/var/log/pague/control-plane-api/application.log
+```
+
+---
+
+## Install Grafana Alloy
+
+```bash
+ALLOY_VERSION=$(curl -s https://api.github.com/repos/grafana/alloy/releases/latest \
+| grep '"tag_name"' \
+| sed -E 's/.*"v([^"]+)".*/\1/')
+
+echo "Installing Grafana Alloy ${ALLOY_VERSION}"
+
+cd /tmp
+
+curl -LO \
+"https://github.com/grafana/alloy/releases/download/v${ALLOY_VERSION}/alloy-linux-amd64.zip"
+
+sudo apt-get install -y unzip
+
+unzip alloy-linux-amd64.zip
+
+sudo mv alloy-linux-amd64 /usr/local/bin/alloy
+sudo chmod +x /usr/local/bin/alloy
+```
+
+Verify the installation:
+
+```bash
+alloy --version
+```
+
+---
+
+## Create the Alloy user
+
+```bash
+sudo useradd \
+  --system \
+  --home /var/lib/alloy \
+  --shell /usr/sbin/nologin \
+  alloy
+
+sudo mkdir -p /var/lib/alloy
+sudo mkdir -p /etc/alloy
+
+sudo chown -R alloy:alloy \
+    /var/lib/alloy \
+    /etc/alloy
+```
+
+---
+
+## Configure Alloy
+
+Create the configuration file:
+
+```bash
+sudo mkdir -p /etc/alloy
+sudo nano /etc/alloy/config.alloy
+```
+
+Paste the following configuration:
+
+```alloy
+logging {
+  level = "info"
+}
+
+local.file_match "pague_logs" {
+  path_targets = [
+    {
+      "__path__" = "/var/log/pague/*/application.log",
+      "platform" = "pague",
+    },
+  ]
+}
+
+loki.source.file "pague_logs" {
+  targets = local.file_match.pague_logs.targets
+
+  forward_to = [
+    loki.process.pague_logs.receiver,
+  ]
+}
+
+loki.process "pague_logs" {
+
+  stage.json {
+
+    expressions = {
+
+      level     = "level",
+      service   = "service",
+      version   = "version",
+      component = "component",
+      traceId   = "traceId",
+      spanId    = "spanId",
+      msg       = "msg",
+      time      = "time",
+    }
+  }
+
+  stage.labels {
+
+    values = {
+
+      platform  = "platform",
+      service   = "service",
+      level     = "level",
+      component = "component",
+    }
+  }
+
+  stage.timestamp {
+
+    source = "time"
+    format = "RFC3339"
+  }
+
+  forward_to = [
+    loki.write.default.receiver,
+  ]
+}
+
+loki.write "default" {
+
+  endpoint {
+
+    url = "http://localhost:3100/loki/api/v1/push"
+  }
+}
+```
+
+---
+
+## Create the systemd service
+
+```bash
+sudo tee /etc/systemd/system/alloy.service >/dev/null <<'EOF'
+[Unit]
+Description=Grafana Alloy
+Documentation=https://grafana.com/docs/alloy/
+After=network.target loki.service
+Requires=loki.service
+
+[Service]
+User=alloy
+Group=alloy
+
+ExecStart=/usr/local/bin/alloy run \
+    --storage.path=/var/lib/alloy \
+    /etc/alloy/config.alloy
+
+Restart=always
+RestartSec=5
+
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
+EOF
+```
+
+Enable Alloy:
+
+```bash
+sudo systemctl daemon-reload
+
+sudo systemctl enable --now alloy
+
+sudo systemctl status alloy
+```
+
+---
+
+## Verify Alloy
+
+Check that Alloy is running:
+
+```bash
+sudo journalctl -u alloy -f
+```
+
+A healthy startup should contain:
+
+```
+Alloy is running
+```
+
+---
+
+### Verify Alloy is discovering log files
+
+```bash
+curl http://127.0.0.1:12345/metrics | grep loki_source_file
+```
+
+Expected metrics include:
+
+- `loki_source_file_files_active_total`
+- `loki_source_file_read_lines_total`
+- `loki_source_file_read_bytes_total`
+
+The number of lines should increase as applications write logs.
+
+---
+
+### Verify Alloy is successfully sending logs to Loki
+
+```bash
+curl http://127.0.0.1:12345/metrics | grep loki_write_sent_entries_total
+```
+
+Expected:
+
+```
+loki_write_sent_entries_total{...} 123
+```
+
+Verify that no entries are being dropped:
+
+```bash
+curl http://127.0.0.1:12345/metrics | grep loki_write_dropped_entries_total
+```
+
+All values should remain **0**.
+
+Confirm successful writes:
+
+```bash
+curl http://127.0.0.1:12345/metrics | grep status_code=\"204\"
+```
+
+HTTP status code **204** indicates Loki accepted the log batches.
+
+---
+
+## Verify in Loki
+
+You can query Loki directly:
+
+```bash
+curl -G http://localhost:3100/loki/api/v1/query_range \
+  --data-urlencode 'query={platform="pague"}'
+```
+
+Or verify through Grafana:
+
+1. Open **Explore**.
+2. Select the **Loki** datasource.
+3. Query all Pague logs:
+
+```logql
+{platform="pague"}
+```
+
+Query a single service:
+
+```logql
+{service="sms-gateway-api"}
+```
+
+Only errors:
+
+```logql
+{service="sms-gateway-api"} | json | level=50
+```
+
+Search for a specific message:
+
+```logql
+{service="sms-gateway-api"} |= "Application started successfully"
+```
+
+Follow logs in real time:
+
+```logql
+{service="sms-gateway-api"}
+```
+
+Click **Live** in Grafana Explore.
+
+---
+
+## Troubleshooting
+
+| Problem | Resolution |
+|----------|------------|
+| Alloy won't start | `sudo journalctl -u alloy -f` |
+| Alloy cannot read log files | `sudo -u alloy cat /var/log/pague/<service>/application.log` |
+| Alloy discovers files but reads 0 lines | Verify the application is writing JSON logs to the expected location. |
+| `loki_write_sent_entries_total` remains 0 | Ensure Loki is running (`curl http://localhost:3100/ready`) and verify the endpoint is `http://localhost:3100/loki/api/v1/push`. |
+| Dropped log entries | Inspect `loki_write_dropped_entries_total` and Alloy logs. |
+| Missing logs for one service | Verify the application's configured log path matches `/var/log/pague/<service>/application.log`. |
+
+---
+
+## Summary
+
+With this architecture:
+
+- **Grafana Alloy** collects structured JSON log files and ships them to Loki.
+- **OpenTelemetry Collector** exports traces to Tempo and metrics to Prometheus.
+- **Loki** stores application logs.
+- **Tempo** stores distributed traces.
+- **Prometheus** stores metrics.
+- **Grafana OSS** provides a unified interface for logs, traces, and metrics.
+
+## 7. Wire up Grafana's data sources
 
 Provisioned as config rather than clicked through the UI, so they survive a reinstall:
 
@@ -423,7 +800,7 @@ Log into Grafana, go to **Connections → Data sources**, and confirm all three 
 
 ---
 
-## 7. Point your NestJS/Node services at the collector
+## 8. Point your NestJS/Node services at the collector
 
 ```bash
 # Environment variables every service reads in its telemetry bootstrap
